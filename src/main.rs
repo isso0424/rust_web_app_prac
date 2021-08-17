@@ -1,4 +1,4 @@
-use actix_web::{get, App, HttpResponse, HttpServer, ResponseError};
+use actix_web::{get, web, App, HttpResponse, HttpServer, ResponseError};
 use askama::Template;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
@@ -9,6 +9,10 @@ use thiserror::Error;
 enum MyError {
     #[error("Failed to render HTML")]
     AskamaError(#[from] askama::Error),
+    #[error("Failed to get connection")]
+    ConnectionPoolError(#[from] r2d2::Error),
+    #[error("Failed SQL execution")]
+    SQLiteError(#[from] rusqlite::Error),
 }
 
 impl ResponseError for MyError {}
@@ -25,16 +29,19 @@ struct IndexTemplate {
 }
 
 #[get("/")]
-async fn index() -> Result<HttpResponse, MyError> {
-    let mut entries = Vec::new();
-    entries.push(TodoEntry {
-        id: 1,
-        text: "First entry".to_string(),
-    });
-    entries.push(TodoEntry {
-        id: 2,
-        text: "Second entry".to_string(),
-    });
+async fn index(db: web::Data<Pool<SqliteConnectionManager>>) -> Result<HttpResponse, MyError> {
+    let conn = db.get()?;
+    let mut statement = conn.prepare("SELECT id, text FROM todo")?;
+    let rows = statement.query_map(params![], |row| {
+        let id = row.get(0)?;
+        let text = row.get(1)?;
+        Ok(TodoEntry { id, text })
+    })?;
+
+    let mut entries = vec![];
+    for row in rows {
+        entries.push(row?);
+    }
 
     let html = IndexTemplate { entries };
     let response_body = html.render()?;
@@ -55,15 +62,19 @@ async fn main() -> Result<(), actix_web::Error> {
         .execute(
             "CREATE TABLE IF NOT EXISTS todo (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL
+            text TEXT NOT NULL)
             ",
             params![],
         )
         .expect("Failed to create a table 'todo'.");
 
-    HttpServer::new(move || App::new().service(index).app_data(pool.clone()))
-        .bind("0.0.0.0:8080")?
-        .run()
-        .await?;
+    HttpServer::new(move || {
+        App::new()
+            .service(index)
+            .app_data(web::Data::new(pool.clone()))
+    })
+    .bind("0.0.0.0:8080")?
+    .run()
+    .await?;
     Ok(())
 }
